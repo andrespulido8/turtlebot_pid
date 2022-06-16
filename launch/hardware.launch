@@ -1,0 +1,45 @@
+<launch>
+
+    <!--Change default to the name of the rigid body you are tracking in optitrak-->
+
+    <arg name="rigid_body"  default="your_rigid_body_name_here"/>
+
+    <!--Node that converts optitrak data to more user friendly forms: NWU & NED pose message topics-->
+
+    <node pkg="ros_vrpn_client" name="$(arg rigid_body)" type="ros_vrpn_client" args="_vrpn_server_ip:=192.168.1.104" required="true" output="screen"/>
+
+    <!--Needed for turning on physical turtlebot-->
+
+    <include file = "$(find turtlebot_bringup)/launch/minimal.launch" />
+
+    <!--Namespace used to group relevant topics together to prevent overlap when using multiple agents-->
+
+    <group ns = "$(arg rigid_body)">
+
+        <!--Example node: pkg=package your code is located, name=identifier for ROS (can be anything), type=c++ executable or python script to be run-->
+
+        <node pkg="your_package_here" name="name_of_node" type="file_executable_name_here" output="screen">
+
+            
+
+            <!--Remaping topics: from=original_topic to=new_topic-->
+
+            
+
+            <!--Examples here are for going from gazebo's turtlebots to physical turtlebots-->
+
+            <remap from="pose_stamped" to="nwu/pose_stamped"/>
+
+            <remap from="velocity_command" to="/mobile_base/commands/velocity"/>
+
+            
+
+            <!--Used to load list of parameters/arguments from a file-->
+
+            <rosparam file="$(find package_to_be_found)/file_location_for_parameters/your_yaml_here.yaml"/>
+
+        </node>
+
+    </group>
+
+</launch>
