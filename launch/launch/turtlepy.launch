@@ -1,0 +1,10 @@
+<launch>
+
+    <!--Launch turtlbot in gazebo -->
+    <include file = "$(find andres_turtlebot_pid)/launch/spawn_empty_world.launch" />
+
+    <!--Example node: pkg=package your code is located, name=identifier for ROS (can be anything), type=c++ executable or python script to be run-->
+    <node pkg="andres_turtlebot_pid" name="turtlebot_pid" type="turtlebot_pid.py" output="screen"/>
+    <node pkg="andres_turtlebot_pid" name="goa_pose" type="goal_pose.py" output="screen"/>
+
+</launch>

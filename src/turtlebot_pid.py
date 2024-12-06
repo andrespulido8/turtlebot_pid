@@ -3,31 +3,47 @@
 import rospy
 import numpy as np
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Pose, Twist
+from geometry_msgs.msg import Pose, Twist, PoseStamped
 from dynamic_reconfigure.server import Server as DynamicReconfigureServer
 from tf.transformations import quaternion_inverse, quaternion_multiply
 import tf.transformations as trans
 #from andres_turtlebot_pid.src import pidcfg
 
-class pid_controller(object):
+class turtlebot_pid_controller(object):
     def __init__(self):
-        # Initialize gains and setup dynamic reconfigure
-        self.last_config = None
+        # Initialize gains and setup dynamic reconfigure  (currently not used)
+        #self.last_config = None
         #self.reconfigure_server = DynamicReconfigureServer(
         #    pidcfg, self.reconfigure)
-        self.kp = np.array([0.4,0.7]) # [x,yaw]
-        self.kd = np.array([0.02,0.02])
-        self.ki = np.array([0.002,0.002])
-        self.saturation = np.array([1,2])
-        self.tolerance = np.array([0.05,0.02])
+
+        self.is_sim = rospy.get_param('/is_sim', True)
+
+        # Gains 
+        if self.is_sim:
+            self.kp = np.array([0.2,0.5]) # [x,yaw]
+            self.kd = np.array([0.1,0.2])
+            self.ki = np.array([0.02,0.01])
+            self.saturation = np.array([0.7,1.6])  # [x,yaw]
+            # amount of error to tolerate before stopping
+            self.tolerance = np.array([0.05,0.01])
+            self.is_debug = False
+        else:
+            # TODO: change this for hardware
+            self.kp = np.array([0.2,0.5]) # [x,yaw]
+            self.kd = np.array([0.1,0.2])
+            self.ki = np.array([0.02,0.01])
+            self.saturation = np.array([0.7,1.6])  # [x,yaw]
+            # amount of error to tolerate before stopping
+            self.tolerance = np.array([0.05,0.01])
+            self.is_debug = False
 
         # Initialize state variables
         self.body_frame = None
         self.global_frame = None
         self.last_update = rospy.get_time()
-        self.desired_position = None
-        self.desired_orientation = None
-        self.desired_twist_world = None
+        self.desired_position = np.array([0,0,0])
+        self.desired_orientation = np.array([0,0,0,1])
+        self.desired_twist_world = np.array([0,0,0,0,0,0])
         self.body_to_world = None
         self.world_to_body = None
         self.position = None
@@ -37,15 +53,17 @@ class pid_controller(object):
         self.pose = None
         self.twist_world = None
         self.twist_body = None
-        rospy.loginfo("Initializing PID controller")
+        rospy.loginfo("Initializing turtlebot PID controller")
 
-        self.command_pub = rospy.Publisher(
-            '/cmd_vel', Twist, queue_size=3)
+        # subcriber for desired state
+        self.ref = rospy.Subscriber(
+            '/goal_pose', Pose, self.goal_pose_cb, queue_size=3)
         self.odom_sub = rospy.Subscriber(
             '/odom', Odometry, self.odom_cb, queue_size=3)
-        #self.ref = rospy.Subscriber(
-        #    '/trajectory', Pose, self.trajectory_cb, queue_size=3)
-        rate = rospy.Rate(10)  # 10hz
+        self.command_pub = rospy.Publisher(
+            '/cmd_vel', Twist, queue_size=3)
+        if not self.is_sim:
+            self.vel_sub = rospy.Subscriber('/pose_stamped', PoseStamped, self.pose_cb, queue_size=3)
 
     @staticmethod
     def parse_gains(gains):
@@ -80,50 +98,57 @@ class pid_controller(object):
         now = rospy.get_time()
         dt  = np.array(now - self.last_update)
 
-        # Calculate error in position, orientation, and twist
+        # Calculate error in position, orientation, and twist (velocities)
         position_error_world = self.desired_position - self.position
         orientation_error_world = self.quat_to_rotvec(quaternion_multiply(
             self.desired_orientation, quaternion_inverse(self.orientation)))
-        pose_error_world = np.concatenate(
-            (position_error_world, orientation_error_world))
-        twist_error_world = self.desired_twist_world - self.twist_world
-        twist_error_body = self.world_to_body.dot(twist_error_world)
+        if self.is_sim:
+            twist_error_world = self.desired_twist_world - self.twist_world
+            err_twist_norm = np.linalg.norm(twist_error_world[:2])
+            feedback_derivative = np.array([self.kd[0]*err_twist_norm, self.kd[1]*twist_error_world[-1]])
         
+        # Compute distance error to goal
         err_pos_norm = np.linalg.norm(position_error_world[:2])
-        err_twist_norm = np.linalg.norm(twist_error_world[:2])
-        self.err_accumulation += np.array([pose_error_world[0], pose_error_world[-1]])*dt 
-        
+
+        # Desired orientation is looking at the goal
         yaw_error = np.arctan2(position_error_world[1], position_error_world[0]) - self.euler_from_quaternion(self.orientation)[2]
-        if np.abs(yaw_error) > np.pi:
-            yaw_error = yaw_error - np.sign(yaw_error) * 2 * np.pi
         if err_pos_norm < self.tolerance[0]:
+            # use desired orientation when close to goal
             yaw_error = orientation_error_world[-1]
-
-        rospy.loginfo("pos norm error: {}".format(err_pos_norm))
-        rospy.loginfo("yaw error: {}".format(yaw_error))
-
+        if np.abs(yaw_error) > np.pi:
+            # Wraps angle
+            yaw_error = yaw_error - np.sign(yaw_error) * 2 * np.pi
+        
+        # Integral of error (and clip if too large)
+        self.err_accumulation += np.array([err_pos_norm, yaw_error])*dt 
+        self.err_accumulation[1] = np.clip(self.err_accumulation[1], -np.pi, np.pi)
+        
         # Calculate feedback
         feedback_proportional = np.array([np.abs(self.kp[0]*err_pos_norm), self.kp[1]*yaw_error])
-        rospy.loginfo("Feedback proportional: {}".format(feedback_proportional)) 
-        feedback_derivative = np.array([self.kd[0]*err_twist_norm, self.kd[1]*twist_error_world[-1]])
-        rospy.loginfo("feedback derivative: {}".format(feedback_derivative))
         feedback_integral = self.ki*self.err_accumulation
-        rospy.loginfo("feedback integral: {}".format(feedback_integral))
-        feedback = feedback_proportional + feedback_derivative + feedback_integral
+        if self.is_sim:
+            feedback = feedback_proportional + feedback_derivative + feedback_integral
+        else:
+            feedback = feedback_proportional + feedback_integral
+        command = np.clip(feedback, np.array([0,-self.saturation[1]]), self.saturation) 
 
         if err_pos_norm < self.tolerance[0]:
             # do not move if position error is small
             command[0] = 0
-        elif yaw_error > self.tolerance[1]:
-            # rotate to position only and delete accumulated error if yaw error is large
+        elif np.abs(yaw_error) > np.pi/4:
+            # rotate to position only and delete accumulated error if yaw error is large (> 90 deg)
             command[0] = 0
-            self.err_accumulation[0] = 0
-        if yaw_error < self.tolerance[1]:
+            self.err_accumulation[0] /= 1.5
+        if np.abs(yaw_error) < self.tolerance[1]:
             # do not rotate if yaw error is small
             command[1] = 0
-        command = np.clip(feedback, np.array([0,-self.saturation[1]]), self.saturation) 
-        rospy.loginfo("command: {}".format(command))
-        print('\n')
+
+        if self.is_debug:
+            rospy.loginfo("Feedback proportional: {}".format(feedback_proportional)) 
+            if self.is_sim:
+                rospy.loginfo("Feedback derivative: {}".format(feedback_derivative))
+            rospy.loginfo("feedback integral: {}".format(feedback_integral))
+            rospy.loginfo("command: {}".format(command))
 
         # Publish command
         self.command_pub.publish(self.make_command_msg(command))
@@ -140,8 +165,7 @@ class pid_controller(object):
 
     @staticmethod
     def quat_to_rotvec(q):
-        '''
-        Convert a quaternion to a rotation vector
+        ''' Convert a quaternion to a rotation vector
         '''
         # For unit quaternion, return 0 0 0
         if np.all(np.isclose(q[0:3], 0)):
@@ -180,72 +204,16 @@ class pid_controller(object):
         mat_h = trans.quaternion_matrix(q)
         return mat_h[:3, :3] / mat_h[3, 3]
 
-    def trajectory_cb(self, msg):
-        self.desired_position = np.array([msg.pose.position.x,
-                                          msg.pose.position.y,
-                                          msg.pose.position.z])
-        self.desired_orientation = np.array([msg.pose.orientation.x,
-                                                msg.pose.orientation.y,
-                                                msg.pose.orientation.z,
-                                                msg.pose.orientation.w])
-        self.desired_twist_world = np.array([msg.twist.linear.x,
-                                                msg.twist.linear.y, 
-                                                msg.twist.linear.z,
-                                                msg.twist.angular.x,
-                                                msg.twist.angular.y,
-                                                msg.twist.angular.z])
-        body_to_world = self.make_double_rotation(
-            self.quaternion_matrix(self.desired_orientation))
-        #self.desired_twist_world = body_to_world.dot(
-        #    np.hstack(twist_to_numpy(msg.posetwist.twist)))
+    def goal_pose_cb(self, msg):
+        self.desired_position = np.array([msg.position.x,
+                                          msg.position.y,
+                                          msg.position.z])
+        self.desired_orientation = np.array([msg.orientation.x,
+                                                msg.orientation.y,
+                                                msg.orientation.z,
+                                                msg.orientation.w])
+        self.desired_twist_world = np.array([0, 0, 0, 0, 0, 0])
     
-    def trajectory(self):
-        z = 0
-        qx = qy = 0
-        k = 1  # Multiplier
-        now = np.array(rospy.get_time()) 
-        rospy.loginfo("Time: {}".format(now))
-        # Initial point
-        if now > 0 and now < 20:
-            x = 0
-            y = -1*k
-            qw = 0.707  # -90 degrees
-            qz = -0.707
-        elif now > 20 and now < 40:
-            # Second point
-            x = 1*k
-            y = -1*k
-            qw = 1
-            qz = 0
-            rospy.loginfo("Time > 20: {}".format(now))
-        elif now > 40 and now < 60:
-            # Third point
-            x = 1*k
-            y = 1*k
-            qw = qz = 0.707 # 90 degrees
-            rospy.loginfo("Time > 40: {}".format(now))
-        elif now > 60 and now < 80:
-            # Fourth point
-            y = 1*k
-            x = 0*k
-            qw = 0
-            qz = 1  # 180 degrees
-            rospy.loginfo("Time > 60: {}".format(now))
-        else:
-            rospy.loginfo("Time else: {}".format(now))
-            x = y = 0
-            qw = 1
-            qz = 0
-            rospy.loginfo("Time > 20: {}".format(now))
-        self.desired_position = np.array([x, y, z])
-        rospy.loginfo("Desired position: {}".format(self.desired_position))
-        self.desired_orientation = np.array([qx, qy, qz, qw])
-        self.desired_twist_world = np.array([0,0,0,0,0,0])  #([vx, vy, vz, wx, wy, wz])
-        body_to_world = self.make_double_rotation(
-            self.quaternion_matrix(self.desired_orientation))
-        #self.desired_twist_world = body_to_world.dot(
-        #    np.hstack(twist_to_numpy(msg.posetwist.twist)))
-
     def odom_cb(self, msg):
         self.body_frame = msg.child_frame_id
         self.global_frame = msg.header.frame_id
@@ -262,19 +230,32 @@ class pid_controller(object):
         angvel = np.array([msg.twist.twist.angular.x,
                             msg.twist.twist.angular.y,
                             msg.twist.twist.angular.z])
-        #rospy.loginfo("Received odometry message: \n{}".format(msg))
         self.body_to_world = self.make_double_rotation(self.quaternion_matrix(self.orientation))
-        self.world_to_body = self.body_to_world.T
+        self.world_to_body = self.body_to_world.T  # currently not used
         self.twist_body = np.concatenate((linvel, angvel))
         self.twist_world = self.body_to_world.dot(self.twist_body)
-        self.trajectory()
+        if self.is_sim:
+            self.computePID()
+
+    def pose_cb(self, msg):
+        # callback for getting hardware pose
+        self.body_frame = msg.child_frame_id
+        self.global_frame = msg.header.frame_id
+        self.position = np.array([msg.pose.position.x, 
+                                    msg.pose.position.y,
+                                    msg.pose.position.z])
+        self.orientation = np.array([msg.pose.orientation.x,
+                                        msg.pose.orientation.y,    
+                                        msg.pose.orientation.z,
+                                        msg.pose.orientation.w])
+        self.body_to_world = self.make_double_rotation(self.quaternion_matrix(self.orientation))
         self.computePID()
 
 
 if __name__ == '__main__':
     try:
         rospy.init_node('turtlebot_PID_controller', anonymous=True)
-        pid = pid_controller()
+        pid = turtlebot_pid_controller()
         rospy.spin()
     except rospy.ROSInterruptException:
         pass
