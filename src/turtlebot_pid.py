@@ -20,8 +20,8 @@ class turtlebot_pid_controller(object):
 
         # Gains 
         if self.is_sim:
-            self.kp = np.array([0.2,0.5]) # [x,yaw]
-            self.kd = np.array([0.1,0.2])
+            self.kp = np.array([0.2,0.9]) # [x,yaw]
+            self.kd = np.array([0.05,0.1])
             self.ki = np.array([0.02,0.01])
             self.saturation = np.array([0.7,1.6])  # [x,yaw]
             # amount of error to tolerate before stopping
